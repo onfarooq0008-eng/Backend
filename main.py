@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -132,6 +133,51 @@ def info_post(body: UrlBody):
     return summarize(extract(body.url))
 
 
+def has_audio(path: str) -> bool:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        return "audio" in out
+    except Exception:
+        return True  # cannot check, assume fine
+
+
+@app.get("/api/formats", dependencies=[Depends(guard)])
+def formats(url: str):
+    """Debug: lists every format yt-dlp sees (codecs tell if a stream has audio)."""
+    info = extract(url)
+    return [
+        {
+            "format_id": f.get("format_id"),
+            "ext": f.get("ext"),
+            "width": f.get("width"),
+            "height": f.get("height"),
+            "vcodec": f.get("vcodec"),
+            "acodec": f.get("acodec"),
+            "abr": f.get("abr"),
+            "protocol": f.get("protocol"),
+        }
+        for f in info.get("formats", [])
+    ]
+
+
+def run_download(url: str, tmp: str, opts: dict) -> str:
+    for f in glob(os.path.join(tmp, "*")):
+        os.remove(f)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(422, str(e).replace("ERROR: ", "")[:300])
+    files = [f for f in glob(os.path.join(tmp, "*")) if not f.endswith((".part", ".ytdl"))]
+    if not files:
+        raise HTTPException(500, "Download produced no file (maybe over size limit)")
+    return max(files, key=os.path.getsize)
+
+
 @app.get("/api/download", dependencies=[Depends(guard)])
 def download(url: str, quality: str = Query("hd", pattern="^(hd|sd|audio)$")):
     """quality = hd | sd | audio. Video is always merged (video+audio) into one MP4."""
@@ -144,31 +190,36 @@ def download(url: str, quality: str = Query("hd", pattern="^(hd|sd|audio)$")):
             max_filesize=MAX_FILESIZE_MB * 1024 * 1024,
             windowsfilenames=True,
         )
+        audio_ok = True
         if quality == "audio":
             opts["format"] = "bestaudio/best"
             opts["postprocessors"] = [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
             ]
             media = "audio/mpeg"
+            path = run_download(url, tmp, opts)
         else:
             h = HD_HEIGHT if quality == "hd" else SD_HEIGHT
-            # separate video + audio streams get merged by ffmpeg (Instagram, YouTube...)
-            opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
-            opts["format_sort"] = ["res", "vcodec:h264", "acodec:aac"]
+            # "res" = SHORT side of the video, so portrait reels (1080x1920) count as 1080p
+            opts["format"] = "bv*+ba/b"
+            opts["format_sort"] = [f"res:{h}", "vcodec:h264", "acodec:aac"]
             opts["merge_output_format"] = "mp4"
-            opts["postprocessor_args"] = {"merger": ["-movflags", "+faststart"]}
             media = "video/mp4"
+            path = run_download(url, tmp, opts)
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except yt_dlp.utils.DownloadError as e:
-            raise HTTPException(422, str(e).replace("ERROR: ", "")[:300])
-
-        files = [f for f in glob(os.path.join(tmp, "*")) if not f.endswith((".part", ".ytdl"))]
-        if not files:
-            raise HTTPException(500, "Download produced no file (maybe over size limit)")
-        path = max(files, key=os.path.getsize)
+            if not has_audio(path):
+                # 2nd try: explicitly merge best video-only + best audio-only
+                opts["format"] = "bv*[acodec=none]+ba[vcodec=none]/b[acodec!=none]"
+                path = run_download(url, tmp, opts)
+            if not has_audio(path):
+                # 3rd try: any single file that already contains audio
+                opts["format"] = "b[acodec!=none][vcodec!=none]"
+                opts.pop("format_sort", None)
+                try:
+                    path = run_download(url, tmp, opts)
+                except HTTPException:
+                    pass
+            audio_ok = has_audio(path)
 
         def cleanup():
             shutil.rmtree(tmp, ignore_errors=True)
@@ -178,6 +229,7 @@ def download(url: str, quality: str = Query("hd", pattern="^(hd|sd|audio)$")):
             path,
             media_type=media,
             filename=os.path.basename(path),
+            headers={"X-Has-Audio": "true" if audio_ok else "false"},
             background=BackgroundTask(cleanup),
         )
     except Exception:
