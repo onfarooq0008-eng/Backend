@@ -164,18 +164,29 @@ def formats(url: str):
     ]
 
 
-def run_download(url: str, tmp: str, opts: dict) -> str:
-    for f in glob(os.path.join(tmp, "*")):
+def run_download(url: str, folder: str, opts: dict) -> str:
+    os.makedirs(folder, exist_ok=True)
+    for f in glob(os.path.join(folder, "*")):
         os.remove(f)
+    opts = dict(opts, outtmpl=os.path.join(folder, "%(title).80B.%(ext)s"))
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(422, str(e).replace("ERROR: ", "")[:300])
-    files = [f for f in glob(os.path.join(tmp, "*")) if not f.endswith((".part", ".ytdl"))]
+    files = [f for f in glob(os.path.join(folder, "*")) if not f.endswith((".part", ".ytdl"))]
     if not files:
         raise HTTPException(500, "Download produced no file (maybe over size limit)")
     return max(files, key=os.path.getsize)
+
+
+def mux(video: str, audio: str, out: str) -> bool:
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", video, "-i", audio, "-map", "0:v:0", "-map", "1:a:0",
+         "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart", out],
+        capture_output=True, timeout=300,
+    )
+    return r.returncode == 0 and os.path.exists(out)
 
 
 @app.get("/api/download", dependencies=[Depends(guard)])
@@ -186,7 +197,6 @@ def download(url: str, quality: str = Query("hd", pattern="^(hd|sd|audio)$")):
     tmp = tempfile.mkdtemp(prefix="dl_")
     try:
         opts = base_opts(
-            outtmpl=os.path.join(tmp, "%(title).80B.%(ext)s"),
             max_filesize=MAX_FILESIZE_MB * 1024 * 1024,
             windowsfilenames=True,
         )
@@ -197,26 +207,35 @@ def download(url: str, quality: str = Query("hd", pattern="^(hd|sd|audio)$")):
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
             ]
             media = "audio/mpeg"
-            path = run_download(url, tmp, opts)
+            path = run_download(url, os.path.join(tmp, "a"), opts)
         else:
             h = HD_HEIGHT if quality == "hd" else SD_HEIGHT
+            vdir = os.path.join(tmp, "v")
             # "res" = SHORT side of the video, so portrait reels (1080x1920) count as 1080p
-            opts["format"] = "bv*+ba/b"
-            opts["format_sort"] = [f"res:{h}", "vcodec:h264", "acodec:aac"]
-            opts["merge_output_format"] = "mp4"
+            vopts = dict(opts, format="bv*+ba/b",
+                         format_sort=[f"res:{h}", "vcodec:h264", "acodec:aac"],
+                         merge_output_format="mp4")
             media = "video/mp4"
-            path = run_download(url, tmp, opts)
+            path = run_download(url, vdir, vopts)
 
             if not has_audio(path):
-                # 2nd try: explicitly merge best video-only + best audio-only
-                opts["format"] = "bv*[acodec=none]+ba[vcodec=none]/b[acodec!=none]"
-                path = run_download(url, tmp, opts)
-            if not has_audio(path):
-                # 3rd try: any single file that already contains audio
-                opts["format"] = "b[acodec!=none][vcodec!=none]"
-                opts.pop("format_sort", None)
+                # Fallback 1: download the audio on its own and join it with ffmpeg
                 try:
-                    path = run_download(url, tmp, opts)
+                    aopts = dict(opts, format="bestaudio/ba/b")
+                    apath = run_download(url, os.path.join(tmp, "a"), aopts)
+                    final = os.path.join(tmp, "final.mp4")
+                    if has_audio(apath) and mux(path, apath, final):
+                        path = final
+                except HTTPException:
+                    pass
+            if not has_audio(path):
+                # Fallback 2: any single file that already contains audio
+                try:
+                    sopts = dict(opts, format="b[acodec!=none][vcodec!=none]",
+                                 merge_output_format="mp4")
+                    spath = run_download(url, os.path.join(tmp, "s"), sopts)
+                    if has_audio(spath):
+                        path = spath
                 except HTTPException:
                     pass
             audio_ok = has_audio(path)
